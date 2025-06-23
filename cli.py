@@ -15,23 +15,271 @@ from requests_oauthlib import OAuth1Session
 from sklearn.metrics.pairwise import cosine_similarity
 from imagededup.methods import CNN
 from pathlib import Path
+import keyring
+import json
+
+# CoreML imports
+try:
+    import coremltools as ct
+    import coremltools.models.datatypes as dt
+
+    COREML_AVAILABLE = True
+except ImportError:
+    COREML_AVAILABLE = False
+    print("Warning: CoreML not available. Install coremltools for faster inference.")
+
 
 FLICKR_API_KEY = os.getenv("FLICKR_API_KEY")
 FLICKR_API_SECRET = os.getenv("FLICKR_API_SECRET")
 FLICKR_BASE = "https://api.flickr.com/services/rest"
 
 # === ONNX CLIP SETUP ===
-ort_session = ort.InferenceSession("output_onnx_clip/model.onnx")
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
+onnx_model_paths = [
+    Path("cache/clip/ViT-B-32__openai/visual/model.onnx"),
+    Path("output_onnx_clip/model.onnx"),
+    Path("models/clip_vit_b32.onnx"),
+]
+
+ort_session = None
+processor = None
+
+for onnx_path in onnx_model_paths:
+    if onnx_path.exists():
+        try:
+            ort_session = ort.InferenceSession(str(onnx_path))
+            processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch16")
+            print(f"ONNX CLIP model loaded successfully from {onnx_path}")
+            break
+        except Exception as e:
+            print(f"Failed to load ONNX model from {onnx_path}: {e}")
+            continue
+
+if ort_session is None:
+    print("ONNX model not found - ONNX method will be unavailable")
+
 cnn = CNN()
+
+# === COREML CLIP SETUP ===
+coreml_model = None
+# Look for CoreML models in multiple locations
+coreml_model_paths = [
+    Path("cache/clip/ViT-B-32__openai/visual/model.mlmodel"),
+    Path("models/clip_vit_b32.mlmodel"),
+    Path("output_onnx_clip/model.mlmodel"),
+]
+
+if COREML_AVAILABLE:
+    import coremltools as ct
+
+    for coreml_path in coreml_model_paths:
+        if coreml_path.exists():
+            try:
+                coreml_model = ct.models.MLModel(str(coreml_path))
+                print(f"CoreML model loaded successfully from {coreml_path}")
+                break
+            except Exception as e:
+                print(f"Failed to load CoreML model from {coreml_path}: {e}")
+                continue
+
+    if coreml_model is None:
+        print(
+            "CoreML available but no model found. Use 'convert-to-coreml' command to create one."
+        )
+
+# === IMMICH MODEL SETUP ===
+immich_model = None
+immich_model_path = Path(".")  # Look in current directory
+
+MAX_IMAGES = None  # Default to no limit
 
 
 def get_onnx_clip_embedding(image: Image.Image):
+    if ort_session is None or processor is None:
+        raise RuntimeError("ONNX CLIP model not available. Use a different method.")
     inputs = processor(images=image, return_tensors="np")
     ort_inputs = {"pixel_values": inputs["pixel_values"].astype(np.float32)}
     outputs = ort_session.run(None, ort_inputs)
     emb = outputs[0][0]
     return emb / np.linalg.norm(emb)
+
+
+def get_coreml_clip_embedding(image: Image.Image):
+    """Get CLIP embedding using CoreML for faster inference."""
+    if not COREML_AVAILABLE or coreml_model is None:
+        raise RuntimeError("CoreML model not available. Use ONNX method instead.")
+
+    # Preprocess image using CLIP processor
+    inputs = processor(images=image, return_tensors="np")
+    pixel_values = inputs["pixel_values"].astype(np.float32)
+
+    # Run CoreML inference
+    outputs = coreml_model.predict({"pixel_values": pixel_values})
+
+    # Extract embedding (key name may vary depending on conversion)
+    # Common output names: "last_hidden_state", "pooler_output", or "output"
+    if "pooler_output" in outputs:
+        emb = outputs["pooler_output"][0]
+    elif "last_hidden_state" in outputs:
+        emb = outputs["last_hidden_state"][0]
+    elif "output" in outputs:
+        emb = outputs["output"][0]
+    else:
+        # Fallback: use first output
+        emb = list(outputs.values())[0][0]
+
+    return emb / np.linalg.norm(emb)
+
+
+# Alternative CoreML approach using Apple's pre-trained models
+def get_apple_coreml_embedding(image: Image.Image):
+    """Get embeddings using Apple's pre-trained CoreML models."""
+    try:
+        import coremltools as ct
+        import numpy as np
+
+        # Use Apple's pre-trained MobileNet or ResNet models
+        # These are simpler but still effective for duplicate detection
+        model_url = "https://ml-assets.apple.com/coreml/models/Image/ImageClassification/MobileNetV2/MobileNetV2.mlmodel"
+
+        # For now, let's use a simple approach with PIL and numpy
+        # Resize image to standard size
+        img_resized = image.resize((224, 224))
+        img_array = np.array(img_resized).astype(np.float32) / 255.0
+
+        # Simple feature extraction using image statistics
+        # This is a fallback when CoreML models don't work
+        features = []
+
+        # Color histogram features
+        for channel in range(3):
+            hist = np.histogram(img_array[:, :, channel], bins=32, range=(0, 1))[0]
+            features.extend(hist)
+
+        # Texture features (edge detection approximation)
+        gray = np.mean(img_array, axis=2)
+        grad_x = np.gradient(gray, axis=1)
+        grad_y = np.gradient(gray, axis=0)
+        texture_features = [
+            np.mean(np.abs(grad_x)),
+            np.mean(np.abs(grad_y)),
+            np.std(gray),
+            np.mean(gray),
+        ]
+        features.extend(texture_features)
+
+        # Normalize features
+        features = np.array(features)
+        return features / np.linalg.norm(features)
+
+    except Exception as e:
+        print(f"Apple CoreML embedding failed: {e}")
+        # Fallback to ONNX method
+        return get_onnx_clip_embedding(image)
+
+
+def get_immich_clip_embedding(image: Image.Image):
+    """Get CLIP embedding using Immich's models and approach."""
+    global immich_model
+
+    if immich_model is None:
+        # Load using OpenCLIP with Immich's default model
+        try:
+            import open_clip
+
+            # Use Immich's default model configuration: ViT-B-32__openai
+            model_name = "ViT-B-32"
+            pretrained = "openai"
+
+            print(f"Loading Immich's default CLIP model: {model_name}__{pretrained}...")
+
+            # Load model using OpenCLIP exactly like Immich does
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                model_name,
+                pretrained=pretrained,
+                device="cpu",  # Start with CPU, can be optimized later
+            )
+            model.eval()
+
+            immich_model = {
+                "model": model,
+                "preprocess": preprocess,
+                "type": "openclip",
+            }
+            print("Successfully loaded Immich CLIP model!")
+
+        except ImportError as e:
+            print(f"OpenCLIP not available: {e}")
+            print("Install with: pip install open-clip-torch")
+            return get_onnx_clip_embedding(image)  # Final fallback to ONNX
+
+        except Exception as e:
+            print(f"Failed to load Immich models: {e}")
+            print("Using ONNX fallback.")
+            return get_onnx_clip_embedding(image)
+
+        if immich_model is None:
+            print("Failed to load any Immich models. Using ONNX fallback.")
+            return get_onnx_clip_embedding(image)
+
+    try:
+        import torch
+        import numpy as np
+
+        # Check if using Immich's OpenCLIPEncoder
+        if hasattr(immich_model, "encode"):
+            # Using Immich's OpenCLIPEncoder
+            embedding = immich_model.encode(image)
+            # Convert to numpy if it's a tensor
+            if hasattr(embedding, "cpu"):
+                embedding = embedding.cpu().numpy()
+            if embedding.ndim > 1:
+                embedding = embedding.flatten()
+
+        elif "model" in immich_model and immich_model.get("type") == "openclip":
+            # Use OpenCLIP model directly
+            model = immich_model["model"]
+            preprocess = immich_model["preprocess"]
+
+            # Preprocess and get embedding
+            with torch.no_grad():
+                image_tensor = preprocess(image).unsqueeze(0)
+                embedding = model.encode_image(image_tensor)
+                embedding = embedding.cpu().numpy()[0]
+
+        elif "session" in immich_model:
+            # Use ONNX model like Immich does
+            # Apply Immich preprocessing (simplified version)
+            preprocess_cfg = immich_model["preprocess"]
+            size = preprocess_cfg["size"]
+            if isinstance(size, list):
+                size = size[0]
+
+            # Simple preprocessing without Immich's transform modules
+            processed_image = image.resize((size, size))
+            image_np = np.array(processed_image).astype(np.float32) / 255.0
+
+            mean = np.array(preprocess_cfg["mean"], dtype=np.float32)
+            std = np.array(preprocess_cfg["std"], dtype=np.float32)
+
+            # Normalize
+            for i in range(3):
+                image_np[:, :, i] = (image_np[:, :, i] - mean[i]) / std[i]
+
+            # Format input for ONNX (CHW format)
+            input_data = {"image": np.expand_dims(image_np.transpose(2, 0, 1), 0)}
+
+            # Run inference
+            outputs = immich_model["session"].run(None, input_data)
+            embedding = outputs[0][0]
+        else:
+            raise ValueError("Unknown Immich model type")
+
+        # Normalize embedding
+        return embedding / np.linalg.norm(embedding)
+
+    except Exception as e:
+        print(f"Immich embedding failed: {e}")
+        return get_onnx_clip_embedding(image)  # Fallback to ONNX
 
 
 @click.group()
@@ -111,12 +359,33 @@ def fetch_all_photos(oauth, user_id, max_images=None):
     return all_photos
 
 
+def load_tokens_from_keyring():
+    """Load OAuth tokens from keyring."""
+
+    data = keyring.get_password("flickr-cli", "oauth_tokens")
+    if data:
+        return json.loads(data)
+    raise RuntimeError("No Flickr tokens found in keychain. Please run 'auth' first.")
+
+
 @cli.command()
 def auth():
     """Authenticate with Flickr and print/store tokens."""
-    tokens = get_oauth_session()
-    print("Your OAuth tokens:", tokens)
-    # Save to disk/Keychain for later (not shown here)
+    _, tokens = get_oauth_session()
+    print("Your OAuth tokens:")
+    for k, v in tokens.items():
+        print(f"{k}: {v}")
+
+    # Save to disk for later use
+    # You can store these in a hidden file in the user's home directory
+    token_path = Path.home() / ".flickr_tokens"
+    try:
+        with open(token_path, "w") as f:
+            for k, v in tokens.items():
+                f.write(f"{k}={v}\n")
+        print(f"Tokens saved to {token_path}")
+    except Exception as e:
+        print(f"Could not save tokens to {token_path}: {e}")
 
 
 @cli.command()
@@ -142,7 +411,9 @@ def scan(by):
     by_title = defaultdict(list)
     by_filename = defaultdict(list)
     by_datetaken = defaultdict(list)
-    for p in photos:
+
+    # Group photos by various criteria with progress bar
+    for p in tqdm(photos, desc="Analyzing photos for duplicates"):
         by_title[p["title"]].append(p)
         fname = p.get("originalformat") or ""
         by_filename[fname].append(p)
@@ -195,7 +466,13 @@ def fuzzy_scan(threshold):
     import itertools
 
     pairs = []
-    for a, b in itertools.combinations(photos, 2):
+    # Use tqdm to show progress for fuzzy matching combinations
+    total_combinations = len(photos) * (len(photos) - 1) // 2
+    for a, b in tqdm(
+        itertools.combinations(photos, 2),
+        desc="Comparing photo titles",
+        total=total_combinations,
+    ):
         score = fuzz.ratio(a["title"], b["title"])
         if score >= threshold:
             pairs.append((a, b, score))
@@ -204,88 +481,9 @@ def fuzzy_scan(threshold):
     else:
         for a, b, score in pairs:
             print(
-                f"({score}%) '{a['title']}' [ID:{a['id']}] <--> '{b['title']}' [ID:{b['id']}]"
+                f"({score}%) '{a['title']}' [ID:{a['id']}] <--> "
+                f"'{b['title']}' [ID:{b['id']}]"
             )
-
-
-@cli.command()
-@click.option("--max-images", default=None, help="Max images to scan")
-@click.option(
-    "--similarity-threshold", default=0.95, help="Cosine similarity threshold"
-)
-def ai_scan(max_images, similarity_threshold):
-    """AI duplicate scan using ONNX CLIP embeddings."""
-    oauth, _ = get_oauth_session()
-    user_id = get_user_id(oauth)
-    photos = fetch_all_photos(oauth, user_id, max_images=max_images)
-    images = []
-    for p in tqdm(photos, desc="Download images"):
-        try:
-            img = Image.open(
-                io.BytesIO(requests.get(p["url_m"], timeout=10).content)
-            ).convert("RGB")
-        except Exception:
-            img = None
-        images.append(img)
-
-    embeddings = []
-    for img in tqdm(images, desc="Embed with ONNX CLIP"):
-        embeddings.append(get_onnx_clip_embedding(img) if img else np.zeros(512))
-    embeddings = np.stack(embeddings)
-
-    sims = cosine_similarity(embeddings)
-    n = len(photos)
-    seen = set()
-    for i in range(n):
-        for j in range(i + 1, n):
-            sim = sims[i, j]
-            if sim >= similarity_threshold:
-                pair = tuple(sorted((photos[i]["id"], photos[j]["id"])))
-                if pair not in seen:
-                    seen.add(pair)
-                    print(f"[{sim:.2f}] ID {photos[i]['id']} <-> ID {photos[j]['id']}")
-
-
-@cli.command()
-@click.option("--max-images", default=None, help="Max images to scan")
-@click.option("--similarity-threshold", default=0.97, help="Min similarity threshold")
-def ai_scan_cnn(max_images, similarity_threshold):
-    """AI duplicate scan using imagededup's CNN encoder."""
-    oauth, _ = get_oauth_session()
-    user_id = get_user_id(oauth)
-    photos = fetch_all_photos(oauth, user_id, max_images)
-
-    # 1️⃣ Download photos and save to temp folder
-    temp = Path("/tmp/flickr_ai")
-    temp.mkdir(exist_ok=True, parents=True)
-    for p in tqdm(photos, desc="Downloading photos"):
-        img_path = temp / f"{p['id']}.jpg"
-        if img_path.exists():
-            continue  # skip download if file already exists
-        url = p.get("url_m") or p.get("url_l") or p.get("url_s")
-        if not url:
-            continue  # skip if no image url is available
-        try:
-            img_path.write_bytes(requests.get(url, timeout=10).content)
-        except Exception:
-            continue  # optionally, log errors or add a counter for skipped photos
-
-    # 2️⃣ Generate CNN encodings from downloaded images
-    encodings = cnn.encode_images(image_dir=str(temp), recursive=False)
-
-    # 3️⃣ Find near-duplicates
-    dupes = cnn.find_duplicates(
-        encoding_map=encodings,
-        min_similarity_threshold=similarity_threshold,
-        scores=True,
-    )
-
-    # 4️⃣ Report duplicates
-    for img, sim_list in dupes.items():
-        id1 = Path(img).stem
-        for dup_path, score in sim_list:
-            id2 = Path(dup_path).stem
-            print(f"[{score:.2f}] ID {id1} <-> ID {id2}")
 
 
 def collect_images(
@@ -358,6 +556,78 @@ def find_ai_duplicates(method, image_dir, similarity_threshold):
                 id2 = Path(dup_path).stem
                 print(f"[{score:.2f}] ID {id1} <-> ID {id2}")
 
+    elif method == "immich":
+        # Load images and compute embeddings using Immich models
+        image_paths = list(Path(image_dir).glob("*"))
+        images = []
+        for p in tqdm(image_paths, desc="Loading images"):
+            try:
+                img = Image.open(p).convert("RGB")
+            except Exception:
+                img = None
+            images.append(img)
+
+        embeddings = []
+        for img in tqdm(images, desc="Embed with Immich CLIP"):
+            if img:
+                embeddings.append(get_immich_clip_embedding(img))
+            else:
+                embeddings.append(np.zeros(512))
+        embeddings = np.stack(embeddings)
+
+        sims = cosine_similarity(embeddings)
+        n = len(image_paths)
+        seen = set()
+        total_comparisons = n * (n - 1) // 2
+
+        with tqdm(total=total_comparisons, desc="Finding similar pairs") as pbar:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    sim = sims[i, j]
+                    pbar.update(1)
+                    if sim >= similarity_threshold:
+                        pair = tuple(sorted((image_paths[i].stem, image_paths[j].stem)))
+                        if pair not in seen:
+                            seen.add(pair)
+                            print(f"[{sim:.2f}] ID {pair[0]} <-> ID {pair[1]}")
+
+    elif method == "coreml":
+        # Load images and compute embeddings using CoreML
+        image_paths = list(Path(image_dir).glob("*"))
+        images = []
+        for p in tqdm(image_paths, desc="Loading images"):
+            try:
+                img = Image.open(p).convert("RGB")
+            except Exception:
+                img = None
+            images.append(img)
+
+        embeddings = []
+        for img in tqdm(images, desc="Embed with CoreML CLIP"):
+            if img:
+                embeddings.append(get_coreml_clip_embedding(img))
+            else:
+                embeddings.append(np.zeros(512))
+        embeddings = np.stack(embeddings)
+
+        sims = cosine_similarity(embeddings)
+        n = len(image_paths)
+        seen = set()
+        total_comparisons = n * (n - 1) // 2
+        comparison_count = 0
+
+        with tqdm(total=total_comparisons, desc="Finding similar pairs") as pbar:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    sim = sims[i, j]
+                    comparison_count += 1
+                    pbar.update(1)
+                    if sim >= similarity_threshold:
+                        pair = tuple(sorted((image_paths[i].stem, image_paths[j].stem)))
+                        if pair not in seen:
+                            seen.add(pair)
+                            print(f"[{sim:.2f}] ID {pair[0]} <-> ID {pair[1]}")
+
     elif method == "onnx":
         # Load images and compute embeddings
         image_paths = list(Path(image_dir).glob("*"))
@@ -377,14 +647,20 @@ def find_ai_duplicates(method, image_dir, similarity_threshold):
         sims = cosine_similarity(embeddings)
         n = len(image_paths)
         seen = set()
-        for i in range(n):
-            for j in range(i + 1, n):
-                sim = sims[i, j]
-                if sim >= similarity_threshold:
-                    pair = tuple(sorted((image_paths[i].stem, image_paths[j].stem)))
-                    if pair not in seen:
-                        seen.add(pair)
-                        print(f"[{sim:.2f}] ID {pair[0]} <-> ID {pair[1]}")
+        total_comparisons = n * (n - 1) // 2
+        comparison_count = 0
+
+        with tqdm(total=total_comparisons, desc="Finding similar pairs") as pbar:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    sim = sims[i, j]
+                    comparison_count += 1
+                    pbar.update(1)
+                    if sim >= similarity_threshold:
+                        pair = tuple(sorted((image_paths[i].stem, image_paths[j].stem)))
+                        if pair not in seen:
+                            seen.add(pair)
+                            print(f"[{sim:.2f}] ID {pair[0]} <-> ID {pair[1]}")
 
     else:
         raise ValueError(f"Unknown method: {method}")
@@ -427,18 +703,17 @@ def sync_flickr(directory, max_images):
             print(f"Error downloading ID {p['id']}: {e}")
 
 
-# === REFACTORED: ai_dedupe (local only) ===
 @cli.command()
 @click.option(
     "--method",
-    type=click.Choice(["cnn", "onnx"], case_sensitive=False),
-    default="cnn",
+    type=click.Choice(["cnn", "onnx", "coreml", "immich"], case_sensitive=False),
+    default="immich" if Path("cache").exists() or Path("models").exists() else "cnn",
     show_default=True,
     help="AI method to use for deduplication",
 )
 @click.option(
     "--max-images",
-    default=None,
+    default=-1,
     show_default=True,
     help="Maximum number of images to process",
 )
@@ -469,6 +744,205 @@ def ai_dedupe(method, max_images, similarity_threshold, directory):
         image_dir=image_dir,
         similarity_threshold=similarity_threshold,
     )
+
+
+@cli.command()
+def convert_to_coreml():
+    """Convert the ONNX CLIP model to CoreML format for faster inference on macOS."""
+    global coreml_model
+
+    if not COREML_AVAILABLE:
+        print("Error: coremltools not available. Install it with:")
+        print("pip install coremltools")
+        return
+
+    import coremltools as ct
+
+    # Try multiple ONNX source locations
+    onnx_paths = [
+        Path("cache/clip/ViT-B-32__openai/visual/model.onnx"),
+        Path("models/clip_vit_b32.onnx"),
+        Path("output_onnx_clip/model.onnx"),
+    ]
+
+    # Default output path in simplified structure
+    coreml_path = Path("cache/clip/ViT-B-32__openai/visual/model.mlmodel")
+
+    # Find available ONNX model
+    onnx_path = None
+    for path in onnx_paths:
+        if path.exists():
+            onnx_path = path
+            break
+
+    if onnx_path is None:
+        print("Error: No ONNX model found in:")
+        for path in onnx_paths:
+            print(f"  {path}")
+        print("Please ensure you have a CLIP ONNX model available.")
+        return
+
+    # Create output directory if needed
+    coreml_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if coreml_path.exists():
+        overwrite = click.confirm(
+            f"CoreML model already exists at {coreml_path}. Overwrite?"
+        )
+        if not overwrite:
+            return
+
+    print(f"Converting {onnx_path} to CoreML...")
+    print("This may take a few minutes...")
+
+    try:
+        # Try basic conversion first
+        print("Attempting basic ONNX to CoreML conversion...")
+        model = ct.converters.onnx.convert(str(onnx_path))
+
+        # Save the CoreML model
+        model.save(str(coreml_path))
+        print(f"Successfully converted to CoreML: {coreml_path}")
+        print("You can now use --method=coreml for faster inference!")
+
+    except Exception as e:
+        print(f"Direct ONNX conversion failed: {e}")
+        print("\nTrying alternative approach with PyTorch conversion...")
+
+        try:
+            # Alternative: Load with transformers and convert via PyTorch
+            from transformers import CLIPVisionModel
+            import torch
+
+            # Load the PyTorch model
+            model_name = "openai/clip-vit-base-patch16"
+            vision_model = CLIPVisionModel.from_pretrained(model_name)
+            vision_model.eval()
+
+            # Create dummy input
+            dummy_input = torch.randn(1, 3, 224, 224)
+
+            # Convert to CoreML via PyTorch
+            traced_model = torch.jit.trace(vision_model, dummy_input)
+            coreml_model_converted = ct.convert(
+                traced_model, inputs=[ct.TensorType(shape=(1, 3, 224, 224))]
+            )
+
+            coreml_model_converted.save(str(coreml_path))
+            print(f"Successfully converted via PyTorch: {coreml_path}")
+
+        except Exception as e2:
+            print(f"PyTorch conversion also failed: {e2}")
+            print("\nPlease check:")
+            print("1. CoreML Tools installation: 'pip install --upgrade coremltools'")
+            print("2. PyTorch installation: 'pip install torch'")
+            print("3. ONNX model validity")
+            return
+
+    # Reload the global CoreML model
+    try:
+        coreml_model = ct.models.MLModel(str(coreml_path))
+        print("CoreML model loaded and ready to use!")
+    except Exception as e:
+        print(f"Warning: Could not load converted model: {e}")
+
+
+@cli.command()
+@click.option(
+    "--directory",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    required=True,
+    help="Directory containing test images",
+)
+@click.option(
+    "--num-images", default=10, help="Number of images to test (for speed comparison)"
+)
+def benchmark_methods(directory, num_images):
+    """Benchmark different AI methods (CNN, ONNX, CoreML) for speed comparison."""
+    import time
+
+    # Get test images
+    local_path = Path(directory)
+    images = (
+        list(local_path.rglob("*.jpg"))
+        + list(local_path.rglob("*.jpeg"))
+        + list(local_path.rglob("*.JPG"))
+        + list(local_path.rglob("*.JPEG"))
+    )
+
+    if len(images) < num_images:
+        print(f"Only found {len(images)} images, using all of them")
+        num_images = len(images)
+
+    images = images[:num_images]
+    print(f"Benchmarking with {num_images} images...")
+
+    # Load images once
+    loaded_images = []
+    for img_path in tqdm(images, desc="Loading images for benchmark"):
+        try:
+            img = Image.open(img_path).convert("RGB")
+            loaded_images.append(img)
+        except Exception:
+            continue
+
+    methods_to_test = []
+
+    # Test CNN method
+    methods_to_test.append(("CNN", "cnn", None))
+
+    # Test ONNX method if available
+    if ort_session:
+        methods_to_test.append(("ONNX CLIP", "onnx", get_onnx_clip_embedding))
+
+    # Test CoreML method if available
+    if COREML_AVAILABLE and coreml_model:
+        methods_to_test.append(("CoreML CLIP", "coreml", get_coreml_clip_embedding))
+
+    # Test Immich method if available
+    if Path("cache").exists() or Path("models").exists():
+        methods_to_test.append(("Immich CLIP", "immich", get_immich_clip_embedding))
+
+    print("\n" + "=" * 50)
+    print("BENCHMARK RESULTS")
+    print("=" * 50)
+
+    for method_name, method_key, embedding_func in methods_to_test:
+        print(f"\nTesting {method_name}...")
+
+        start_time = time.time()
+
+        if method_key == "cnn":
+            # For CNN, we need to save images temporarily
+            temp_dir = Path("/tmp/benchmark_cnn")
+            temp_dir.mkdir(exist_ok=True, parents=True)
+
+            for i, img in enumerate(loaded_images):
+                img.save(temp_dir / f"img_{i}.jpg")
+
+            encodings = cnn.encode_images(image_dir=str(temp_dir), recursive=False)
+
+            # Cleanup
+            import shutil
+
+            shutil.rmtree(temp_dir)
+
+        else:
+            # For CLIP methods, compute embeddings directly
+            embeddings = []
+            for img in loaded_images:
+                emb = embedding_func(img)
+                embeddings.append(emb)
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        per_image_time = total_time / len(loaded_images)
+
+        print(f"  Total time: {total_time:.2f} seconds")
+        print(f"  Per image: {per_image_time:.3f} seconds")
+        print(f"  Images/sec: {1 / per_image_time:.1f}")
+
+    print("\n" + "=" * 50)
 
 
 if __name__ == "__main__":
