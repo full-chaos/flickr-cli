@@ -66,19 +66,10 @@ def load_heavy_imports():
         _imagededup_available = False
         CNN = None
 
-    # Try CoreML imports (suppress warnings)
-    try:
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            import coremltools as ct
-            import coremltools.models.datatypes as dt
-        _coreml_available = True
-        COREML_AVAILABLE = True
-    except ImportError:
-        _coreml_available = False
-        COREML_AVAILABLE = False
+    # Don't load CoreML by default to avoid startup warnings
+    # It will be loaded only when specifically needed
+    _coreml_available = None
+    COREML_AVAILABLE = False
 
     _heavy_imports_loaded = True
 
@@ -157,7 +148,7 @@ def initialize_coreml():
     """Initialize CoreML model if available."""
     global coreml_model
 
-    if not _coreml_available:
+    if not load_coreml_if_needed():
         return False
 
     import coremltools as ct
@@ -188,9 +179,6 @@ MAX_IMAGES = None  # Default to no limit
 def download_clip_onnx_model():
     """Download CLIP ONNX model if not present."""
     import urllib.request
-    import zipfile
-    import tempfile
-    import shutil
 
     # Check if model already exists
     model_paths = [
@@ -204,35 +192,12 @@ def download_clip_onnx_model():
             print(f"ONNX model found at {path}")
             return path
 
-    print("Downloading CLIP ONNX model...")
-    # Use Hugging Face's ONNX model endpoint
-    base_url = "https://huggingface.co/openai/clip-vit-base-patch16/resolve/main/"
-    model_files = [
-        "model.onnx",
-        "config.json",
-        "preprocessor_config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "vocab.json",
-        "special_tokens_map.json",
-    ]
-
-    # Create output directory
-    output_dir = "cache"
-    os.makedirs(output_dir, exist_ok=True)
-
-    try:
-        for filename in model_files:
-            url = base_url + filename
-            output_path = os.path.join(output_dir, filename)
-            print(f"Downloading {filename}...")
-            urllib.request.urlretrieve(url, output_path)
-
-        print(f"ONNX model downloaded to {output_dir}/")
-        return os.path.join(output_dir, "model.onnx")
-    except Exception as e:
-        print(f"Failed to download ONNX model: {e}")
-        return None
+    print("ONNX model auto-download not currently supported.")
+    print("Please manually download an ONNX CLIP model to one of these locations:")
+    for path in model_paths:
+        print(f"  - {path}")
+    print("\nAlternatively, use --method=immich (default) which auto-downloads models.")
+    return None
 
 
 def download_coreml_model():
@@ -284,17 +249,21 @@ def check_model_requirements():
 
     # Check Immich/OpenCLIP (auto-downloads)
     try:
-        import open_clip
+        # Use importlib to check if open_clip is available without importing it
+        import importlib.util
 
-        available_methods.append("immich")
+        if importlib.util.find_spec("open_clip") is not None:
+            available_methods.append("immich")
     except ImportError:
         pass
 
     # Check CNN (imagededup - no model files needed)
     try:
-        from imagededup.methods import CNN
+        # Use importlib to check if imagededup is available without importing it
+        import importlib.util
 
-        available_methods.append("cnn")
+        if importlib.util.find_spec("imagededup") is not None:
+            available_methods.append("cnn")
     except ImportError:
         pass
 
@@ -345,7 +314,10 @@ def get_onnx_clip_embedding(image):
             except Exception as e:
                 raise RuntimeError(f"Failed to load ONNX model: {e}")
         else:
-            raise RuntimeError("ONNX model download failed")
+            raise RuntimeError(
+                "ONNX model not found. Please manually download one or use "
+                "--method=immich which auto-downloads models."
+            )
 
     inputs = processor(images=image, return_tensors="np")
     ort_inputs = {"pixel_values": inputs["pixel_values"].astype(np.float32)}
@@ -357,10 +329,12 @@ def get_onnx_clip_embedding(image):
 def get_coreml_clip_embedding(image):
     """Get CLIP embedding using CoreML for faster inference."""
     load_heavy_imports()
-    global coreml_model, processor
 
-    if not _coreml_available:
-        raise RuntimeError("CoreML not available. Use ONNX method instead.")
+    if not load_coreml_if_needed():
+        print("CoreML not available. Using ONNX fallback.")
+        return get_onnx_clip_embedding(image)
+
+    global coreml_model, processor
 
     if coreml_model is None:
         # Try to download and load the model
@@ -407,6 +381,10 @@ def get_coreml_clip_embedding(image):
 def get_apple_coreml_embedding(image):
     """Get embeddings using Apple's pre-trained CoreML models."""
     load_heavy_imports()
+
+    if not load_coreml_if_needed():
+        print("CoreML not available. Using ONNX fallback.")
+        return get_onnx_clip_embedding(image)
 
     try:
         import coremltools as ct
@@ -847,16 +825,8 @@ def find_ai_duplicates(method, image_dir, similarity_threshold):
                 "scikit-learn not available. Install with: pip install scikit-learn"
             )
 
-        # Load images and compute embeddings using the selected method
+        # Process images one by one to avoid loading all into memory
         image_paths = list(Path(image_dir).glob("*"))
-        images = []
-        for p in tqdm(image_paths, desc="Loading images"):
-            try:
-                img = Image.open(p).convert("RGB")
-            except Exception:
-                img = None
-            images.append(img)
-
         embeddings = []
         embedding_func = {
             "immich": get_immich_clip_embedding,
@@ -864,11 +834,17 @@ def find_ai_duplicates(method, image_dir, similarity_threshold):
             "onnx": get_onnx_clip_embedding,
         }[method]
 
-        for img in tqdm(images, desc=f"Embed with {method.upper()} CLIP"):
-            if img:
-                embeddings.append(embedding_func(img))
-            else:
+        for p in tqdm(image_paths, desc=f"Processing with {method.upper()} CLIP"):
+            try:
+                img = Image.open(p).convert("RGB")
+                embedding = embedding_func(img)
+                embeddings.append(embedding)
+                # Explicitly delete the image to free memory
+                del img
+            except Exception:
+                # Use zero embedding for failed images
                 embeddings.append(np.zeros(512))
+
         embeddings = np.stack(embeddings)
 
         sims = cosine_similarity(embeddings)
@@ -1192,6 +1168,33 @@ def benchmark_methods(directory, num_images):
         print(f"  Images/sec: {1 / per_image_time:.1f}")
 
     print("\n" + "=" * 50)
+
+
+def load_coreml_if_needed():
+    """Load CoreML imports only when needed to avoid startup warnings."""
+    global _coreml_available, COREML_AVAILABLE
+
+    if _coreml_available is not None:
+        return _coreml_available
+
+    try:
+        import warnings
+        import os
+
+        # Suppress CoreML warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # Set environment variables to suppress CoreML errors
+            os.environ["COREML_SILENCE_ERRORS"] = "1"
+            import coremltools as ct
+            import coremltools.models.datatypes as dt
+        _coreml_available = True
+        COREML_AVAILABLE = True
+        return True
+    except ImportError:
+        _coreml_available = False
+        COREML_AVAILABLE = False
+        return False
 
 
 if __name__ == "__main__":
